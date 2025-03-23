@@ -1,6 +1,7 @@
 from datetime import datetime
 import tensorflow as tf
 from tensorflow import keras
+from keras.metrics import RootMeanSquaredError 
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
@@ -65,4 +66,33 @@ model.add(keras.layers.Dense(1))
 
 print(model.summary())
 
+#Analyze loss & optimization
+model.compile(optimizer='adam', 
+            loss='mae', 
+            metrics=[RootMeanSquaredError()]) 
+history = model.fit(X_train, y_train, 
+                    epochs=20) 
+
+#Evaluate prediction
+testing = ss[training-60:,:]
+x0_test = []
+y_test = dataset[training:, :]
+
+for i in range(60, len(testing)):
+        x0_test.append(testing[i-60:i, 0])
+x0_test = np.array(x0_test)
+x1_test = np.reshape(x0_test, (x0_test.shape[0], x0_test.shape[1], 1))
+
+prediction = model.predict(x1_test)
+
+train = tqqq[:training]
+test = tqqq[training:]
+test['Predictions'] = prediction
+
+plt.figure(figsize=(10, 8))
+plt.plot(train['close'], c="b")
+plt.plot(test[['close', 'Predictions']])
+plt.title('TQQQ Stock Close Price')
+plt.ylabel("Close")
+plt.legend(['Train', 'Test', 'Predictions'])
 
