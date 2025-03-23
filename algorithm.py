@@ -1,6 +1,7 @@
 from datetime import datetime
 import tensorflow as tf
 from tensorflow import keras
+from tensorflow.keras.optimizers import Adam
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
@@ -21,11 +22,20 @@ plt.plot(tqqq['Date'],
         color="blue", 
         label="Open") 
 plt.plot(tqqq['Date'], 
-        tqqq['Close'], 
+        tqqq['High'], 
         color="green", 
+        label="High") 
+plt.plot(tqqq['Date'], 
+        tqqq['Low'], 
+        color="red", 
+        label="Low") 
+plt.plot(tqqq['Date'], 
+        tqqq['Close'], 
+        color="black", 
         label="Close") 
 plt.title("tqqq Open-Close Stock") 
 plt.legend() 
+plt.show()
 
 # prepare the training set samples 
 tqqqClose = tqqq.filter(['Close']) 
@@ -67,8 +77,9 @@ print(model.summary())
 #     squared_difference = ops.square(y_true - y_pred)
 #     return ops.mean(squared_difference, axis=-1)
 
-model.compile(optimizer='adam', loss='mae', metrics=[keras.metrics.RootMeanSquaredError()]) 
-history = model.fit(x1_train, y_train, epochs=25) 
+optimizer = Adam(learning_rate=0.0005, clipvalue=1.0)
+model.compile(optimizer=optimizer, loss='mae', metrics=[keras.metrics.RootMeanSquaredError()])
+history = model.fit(x1_train, y_train, epochs=10, batch_size=32, validation_split=0.1) 
 
 #Evaluate prediction
 testing = scaled_data[training-60:,:]
@@ -85,14 +96,28 @@ prediction = model.predict(x1_test)
 
 #Predictions
 train = tqqq[:training]
-test = tqqq[training:]
-test['Predictions'] = prediction
+test = tqqq[training:].copy()
+test.loc[:, 'Predictions'] = prediction
 
 #Plot prediction
-plt.figure(figsize=(10, 8))
-plt.plot(train['Close'], c="b")
-plt.plot(test[['Close', 'Predictions']])
-plt.title('TQQQ Stock Close Price')
-plt.ylabel("Close")
-plt.legend(['Train', 'Test', 'Predictions'])
+plt.figure(figsize=(12, 8))
 
+# Convert Date column to datetime (if not already converted)
+tqqq['Date'] = pd.to_datetime(tqqq['Date'])
+
+# Plot Open and Close prices
+plt.plot(tqqq['Date'], tqqq['Open'], color="blue", label="Open")
+plt.plot(tqqq['Date'], tqqq['Close'], color="black", label="Close")
+plt.plot(tqqq['Date'], tqqq['High'], color="green", label="High")
+plt.plot(tqqq['Date'], tqqq['Low'], color="red", label="Low")
+
+# Plot test and predictions with proper alignment
+plt.plot(tqqq['Date'][training:], test['Close'], color="orange", label="Test (Actual)")
+plt.plot(tqqq['Date'][training:], test['Predictions'], color="purple", label="Predictions")
+
+# Title, labels, and legend
+plt.title("TQQQ Stock Price with Test and Predictions")
+plt.xlabel("Date")
+plt.ylabel("Price")
+plt.legend()
+plt.show()
