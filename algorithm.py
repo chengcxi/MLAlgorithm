@@ -51,10 +51,10 @@ train_data = scaled_data[0:int(training), :]
 x0_train = [] 
 y_train = [] 
 
-# considering 60 as the batch size, 
+# considering 120 as the batch size, 
 # create x1_train and y_train 
-for i in range(60, len(train_data)): 
-    x0_train.append(train_data[i-60:i, 0]) 
+for i in range(120, len(train_data)): 
+    x0_train.append(train_data[i-120:i, 0]) 
     y_train.append(train_data[i, 0]) 
 
 x_train, y_train = np.array(x0_train), np.array(y_train) 
@@ -79,15 +79,15 @@ print(model.summary())
 
 optimizer = Adam(learning_rate=0.0005, clipvalue=1.0)
 model.compile(optimizer=optimizer, loss='mae', metrics=[keras.metrics.RootMeanSquaredError()])
-history = model.fit(x1_train, y_train, epochs=10, batch_size=32, validation_split=0.1) 
+history = model.fit(x1_train, y_train, epochs=10 , batch_size=16, validation_split=0.1) 
 
 #Evaluate prediction
-testing = scaled_data[training-60:,:]
+testing = scaled_data[training-120:,:]
 x0_test = []
 y_test = dataset[training:, :]
 
-for i in range(60, len(testing)):
-        x0_test.append(testing[i-60:i, 0])
+for i in range(120, len(testing)):
+        x0_test.append(testing[i-120:i, 0])
 
 x0_test = np.array(x0_test)
 x1_test = np.reshape(x0_test, (x0_test.shape[0], x0_test.shape[1], 1))
