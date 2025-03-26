@@ -2,122 +2,111 @@ from datetime import datetime
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.optimizers import Adam
-import pandas as pd
+import polars as pl
+from pandas.tseries.offsets import BDay
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
-import seaborn as sns
 
-#Panda describe data
-tqqq = pd.read_csv('tqqq.csv')
+# Load Data using Polars
+tqqq = pl.read_csv("tqqq.csv")
+tqqq = tqqq.with_columns(pl.col("Date").str.to_datetime()) # Convert Date column to datetime
+
+#Graph0 (Graphical Representation of the data)
 print(tqqq.head())
-tqqq.shape
-tqqq.info()
-tqqq.describe()
+print(tqqq.shape)
+print(tqqq.describe())
 
-#Open/Close price chart
-tqqq['Date'] = pd.to_datetime(tqqq['Date'])
-plt.plot(tqqq['Date'], 
-        tqqq['Open'], 
-        color="blue", 
-        label="Open") 
-plt.plot(tqqq['Date'], 
-        tqqq['High'], 
-        color="green", 
-        label="High") 
-plt.plot(tqqq['Date'], 
-        tqqq['Low'], 
-        color="red", 
-        label="Low") 
-plt.plot(tqqq['Date'], 
-        tqqq['Close'], 
-        color="black", 
-        label="Close") 
-plt.title("tqqq Open-Close Stock") 
-plt.legend() 
-plt.show()
+# Sort Data by Date & extract features (Opening Price) and labels (Low, High, Close)
+tqqq = tqqq.sort("Date")
+features = tqqq.select(["Open"]).to_numpy()  # Input feature: Open price
+labels = tqqq.select(["Low", "High", "Close"]).to_numpy()  # Output labels: Low, High, Close
 
-# prepare the training set samples 
-tqqqClose = tqqq.filter(['Close']) 
-dataset = tqqqClose.values 
-training = int(np.ceil(len(dataset) * .95)) 
+# Convert to NumPy arrays and reshape
+features = np.array(features).reshape(-1, 1)
+labels = np.array(labels).reshape(-1, 3)
 
-# scale the data 
-scaler = MinMaxScaler(feature_range=(0, 1))
-scaled_data = scaler.fit_transform(dataset)
+# Split into training and testing & normalize data using MinMaxScaler
+training_size = int(np.ceil(len(features) * 0.95))  # 95% for training
 
-train_data = scaled_data[0:int(training), :] 
+feature_scaler = MinMaxScaler(feature_range=(0, 1))
+label_scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_features = feature_scaler.fit_transform(features)
+scaled_labels = label_scaler.fit_transform(labels)
 
-x0_train = [] 
-y_train = [] 
+# Create training sequences
+SEQ_LENGTH = 120  # Lookback period
 
-# considering 120 as the batch size, 
-# create x1_train and y_train 
-for i in range(120, len(train_data)): 
-    x0_train.append(train_data[i-120:i, 0]) 
-    y_train.append(train_data[i, 0]) 
+x_train, y_train = [], []
+for i in range(SEQ_LENGTH, training_size):
+    x_train.append(scaled_features[i - SEQ_LENGTH:i, 0])  # Last 120 days of Open prices
+    y_train.append(scaled_labels[i, :])  # Predict Low, High, Close
 
-x_train, y_train = np.array(x0_train), np.array(y_train) 
-x1_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))  # Use x_train instead
+# Convert to NumPy arrays
+x_train, y_train = np.array(x_train), np.array(y_train)
+x_train = x_train.reshape(x_train.shape[0], x_train.shape[1], 1)  # Reshape for LSTM
 
-#RNN Model
-model = keras.models.Sequential()
-model.add(keras.layers.LSTM(units=64, return_sequences=True, input_shape=(x1_train.shape[1], 1)))
-model.add(keras.layers.LSTM(units=64))
-model.add(keras.layers.Dense(128))
-model.add(keras.layers.Dropout(0.5))
-model.add(keras.layers.Dense(1))
+# Build LSTM Model
+model = keras.models.Sequential([
+    keras.layers.LSTM(units=64, return_sequences=True, input_shape=(SEQ_LENGTH, 1)),
+    keras.layers.LSTM(units=64),
+    keras.layers.Dense(128, activation='relu'),
+    keras.layers.Dropout(0.5),
+    keras.layers.Dense(3)  # Output 3 values: Low, High, Close
+])
 
 print(model.summary())
 
-#Analyze loss & optimization
-
-#Custom loss function
-# def my_loss_fn(y_true, y_pred):
-#     squared_difference = ops.square(y_true - y_pred)
-#     return ops.mean(squared_difference, axis=-1)
-
+# Compile & train the model
 optimizer = Adam(learning_rate=0.0005, clipvalue=1.0)
-model.compile(optimizer=optimizer, loss='mae', metrics=[keras.metrics.RootMeanSquaredError()])
-history = model.fit(x1_train, y_train, epochs=10 , batch_size=16, validation_split=0.1) 
+model.compile(optimizer=optimizer, loss="mae", metrics=[keras.metrics.RootMeanSquaredError()])
 
-#Evaluate prediction
-testing = scaled_data[training-120:,:]
-x0_test = []
-y_test = dataset[training:, :]
+history = model.fit(x_train, y_train, epochs=5, batch_size=16, validation_split=0.1)
 
-for i in range(120, len(testing)):
-        x0_test.append(testing[i-120:i, 0])
+# Prepare Test Data
+test_data = scaled_features[training_size - SEQ_LENGTH:]  # Use last 120 points
 
-x0_test = np.array(x0_test)
-x1_test = np.reshape(x0_test, (x0_test.shape[0], x0_test.shape[1], 1))
+x_test = []
+for i in range(SEQ_LENGTH, len(test_data)):
+    x_test.append(test_data[i - SEQ_LENGTH:i, 0])
 
-prediction = model.predict(x1_test)
+x_test = np.array(x_test)
+x_test = x_test.reshape(x_test.shape[0], x_test.shape[1], 1)
 
-#Predictions
-train = tqqq[:training]
-test = tqqq[training:].copy()
-test.loc[:, 'Predictions'] = prediction
+# Predict Future Prices
+future_predictions = []
+current_batch = test_data[-SEQ_LENGTH:].reshape((1, SEQ_LENGTH, 1))
 
-#Plot prediction
-plt.figure(figsize=(12, 8))
+for i in range(30):  # Predict next 30 days
+    pred = model.predict(current_batch)[0]  # Predict Low, High, Close
+    future_predictions.append(pred)
 
-# Convert Date column to datetime (if not already converted)
-tqqq['Date'] = pd.to_datetime(tqqq['Date'])
+    # Shift input sequence and add the prediction
+    new_sequence = np.append(current_batch[:, 1:, :], [[[pred[2]]]], axis=1)  # Use predicted Close
+    current_batch = new_sequence
 
-# Plot Open and Close prices
-plt.plot(tqqq['Date'], tqqq['Open'], color="blue", label="Open")
-plt.plot(tqqq['Date'], tqqq['Close'], color="black", label="Close")
-plt.plot(tqqq['Date'], tqqq['High'], color="green", label="High")
-plt.plot(tqqq['Date'], tqqq['Low'], color="red", label="Low")
+# Inverse transform predictions
+future_predictions = label_scaler.inverse_transform(np.array(future_predictions))
 
-# Plot test and predictions with proper alignment
-plt.plot(tqqq['Date'][training:], test['Close'], color="orange", label="Test (Actual)")
-plt.plot(tqqq['Date'][training:], test['Predictions'], color="purple", label="Predictions")
+# Write future dates
+last_date = tqqq["Date"].to_list()[-1]
+future_dates = [last_date + BDay(i) for i in range(1, 31)]
 
-# Title, labels, and legend
-plt.title("TQQQ Stock Price with Test and Predictions")
+# Plot the results
+plt.figure(figsize=(14, 8))
+plt.plot(tqqq["Date"], tqqq["Open"], color="blue", label="Open Price")
+plt.plot(tqqq["Date"], tqqq["Close"], color="black", label="Close Price")
+plt.plot(tqqq["Date"], tqqq["High"], color="green", label="High Price")
+plt.plot(tqqq["Date"], tqqq["Low"], color="red", label="Low Price")
+
+# Plot predicted values
+plt.plot(future_dates, future_predictions[:, 0], color="purple", label="Predicted Low")
+plt.plot(future_dates, future_predictions[:, 1], color="orange", label="Predicted High")
+plt.plot(future_dates, future_predictions[:, 2], color="brown", label="Predicted Close")
+
+plt.title("TQQQ Stock Price Prediction")
 plt.xlabel("Date")
 plt.ylabel("Price")
 plt.legend()
+plt.grid(True)
 plt.show()
