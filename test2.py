@@ -16,7 +16,7 @@ test_df['Date'] = pd.to_datetime(test_df['Date'])
 test_df.set_index('Date', inplace=True)
 
 # Extract the 'Close' prices (this is the feature used for prediction)
-close_data = test_df[['Close']].values  # Use only the 'Close' column
+close_data = test_df[['Open']].values  # Use only the 'Close' column
 
 # Normalize the 'Close' prices using the same scaler from training
 scaler = MinMaxScaler(feature_range=(0, 1))
