@@ -10,19 +10,15 @@ import numpy as np
 
 # Load Data using Polars
 tqqq = pl.read_csv("tqqq.csv")
+tqqq = tqqq.with_columns(pl.col("Date").str.to_datetime()) # Convert Date column to datetime
 
-# Convert Date column to datetime
-tqqq = tqqq.with_columns(pl.col("Date").str.to_datetime())
-
-# Print dataset info
+#Graph0 (Graphical Representation of the data)
 print(tqqq.head())
 print(tqqq.shape)
 print(tqqq.describe())
 
-# Sort Data by Date
+# Sort Data by Date & extract features (Opening Price) and labels (Low, High, Close)
 tqqq = tqqq.sort("Date")
-
-# Extract features (Opening Price) and labels (Low, High, Close)
 features = tqqq.select(["Open"]).to_numpy()  # Input feature: Open price
 labels = tqqq.select(["Low", "High", "Close"]).to_numpy()  # Output labels: Low, High, Close
 
@@ -30,13 +26,11 @@ labels = tqqq.select(["Low", "High", "Close"]).to_numpy()  # Output labels: Low,
 features = np.array(features).reshape(-1, 1)
 labels = np.array(labels).reshape(-1, 3)
 
-# Split into training and testing
+# Split into training and testing & normalize data using MinMaxScaler
 training_size = int(np.ceil(len(features) * 0.95))  # 95% for training
 
-# Normalize data using MinMaxScaler
 feature_scaler = MinMaxScaler(feature_range=(0, 1))
 label_scaler = MinMaxScaler(feature_range=(0, 1))
-
 scaled_features = feature_scaler.fit_transform(features)
 scaled_labels = label_scaler.fit_transform(labels)
 
@@ -63,11 +57,10 @@ model = keras.models.Sequential([
 
 print(model.summary())
 
-# Compile the model
+# Compile & train the model
 optimizer = Adam(learning_rate=0.0005, clipvalue=1.0)
 model.compile(optimizer=optimizer, loss="mae", metrics=[keras.metrics.RootMeanSquaredError()])
 
-# Train the model
 history = model.fit(x_train, y_train, epochs=5, batch_size=16, validation_split=0.1)
 
 # Prepare Test Data
@@ -95,7 +88,7 @@ for i in range(30):  # Predict next 30 days
 # Inverse transform predictions
 future_predictions = label_scaler.inverse_transform(np.array(future_predictions))
 
-# Generate future dates
+# Write future dates
 last_date = tqqq["Date"].to_list()[-1]
 future_dates = [last_date + BDay(i) for i in range(1, 31)]
 
