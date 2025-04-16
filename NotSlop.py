@@ -7,14 +7,13 @@ from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 import seaborn as sns
 
-#Read table
+#Read TQQQ
 tqqq = pl.read_csv('tqqq.csv', try_parse_dates= True)
 tqqq.shape
 tqqq.describe()
 tqqq = tqqq.sort("Date")
 df = pl.DataFrame(tqqq)
 df = df.sort('Date')
-
 
 # Preprocess data
 # Scales data to be floats from 0-1 because lstms work better with similar values across the board
