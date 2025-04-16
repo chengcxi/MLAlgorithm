@@ -4,16 +4,33 @@ from tensorflow import keras
 import polars as pl
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import GradientBoostingRegressor
 import numpy as np
 import seaborn as sns
 
-#Read TQQQ
+#Read table
 tqqq = pl.read_csv('tqqq.csv', try_parse_dates= True)
 tqqq.shape
 tqqq.describe()
 tqqq = tqqq.sort("Date")
 df = pl.DataFrame(tqqq)
 df = df.sort('Date')
+
+vix = pl.read_csv('vix.csv', try_parse_dates= True)
+vix = vix.sort("Date")
+vix_df = pl.DataFrame(vix)
+vix_df = vix_df.sort('Date')
+
+plt.figure(figsize=(12,6))
+plt.plot(df['Date'], df['Close'], label='TQQQ vs VIX Close Price')
+plt.plot(vix_df['Date'], vix_df['Close'], label='VIX Close Price')
+plt.title('TQQQ vs VIX Close Price')
+plt.xlabel('Date')
+plt.ylabel('Price ($)')
+plt.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
 
 # Preprocess data
 # Scales data to be floats from 0-1 because lstms work better with similar values across the board
@@ -27,12 +44,41 @@ scaled_tqqq = scaler.fit_transform(df[doscale])
 # Converts scaled_tqqq(numpy array) to pandas dataframe
 scaled_df = pl.DataFrame(scaled_tqqq, schema=doscale)
 
+# Add VIX data to the scaled dataframe
+merged = df.join(vix_df, on='Date', how='inner', suffix='_vix')
+
+# Gradient Boosting Regressor
+vix_features = [col for col in vix_df.columns if col not in ['Date', 'Volume']]
+X = merged.select([f"{col}_vix" for col in vix_features]).to_numpy()
+y = merged['Close'].to_numpy()
+
+split_idx = int(len(X) * 0.8)
+X_train, X_test = X[:split_idx], X[split_idx:]
+y_train, y_test = y[:split_idx], y[split_idx:]
+
+# Train GBDT
+gbdt = GradientBoostingRegressor(n_estimators=100, random_state=42)
+gbdt.fit(X_train, y_train)
+
+# Predict using GBDT
+gbdt_preds = gbdt.predict(X)
+merged = merged.with_columns(pl.Series("GBDT_Pred", gbdt_preds))
+
+# Include GBDT predictions in the scaled dataframe
+noscale = ['Date','Volume','Volume_vix']
+doscale = [col for col in merged.columns if col not in noscale]
+
+# Scale the merged dataframe
+scaler = MinMaxScaler(feature_range=(0,1))
+scaled_merged = scaler.fit_transform(merged[doscale])
+scaled_df = pl.DataFrame(scaled_merged, schema=doscale)
+
 # Make new scaler
 # The reason we need a new scaler because the first one operated on an array with shape (n,5)
 # but now need one for array with shape (n,1) because thats our output shape
 # we can use the .fit function to only fit it to close prices
 close_scaler = MinMaxScaler(feature_range=(0,1))
-close_scaler.fit(df.select("Close").to_numpy())
+close_scaler.fit(merged.select("Close").to_numpy())
 
 # Make Sequences
 # Partitions data into sequences meant to predict the value directly after them
@@ -101,7 +147,7 @@ model.compile(
     # and is well suited for problems that are large in terms of data/parameters".""
     # Whatever the fuck this means ^^^^^^
     # Learning Rate can be tweaked to attempt to improve model accuracy or training speed
-    optimizer = keras.optimizers.Adam(learning_rate=0.0001),
+    optimizer = keras.optimizers.Adam(learning_rate=0.005),
 
     # Choosing a loss equation in this case, compares the mean of the squares of errors between label and preduiction
     loss = keras.losses.MeanSquaredError()
@@ -116,7 +162,7 @@ history = model.fit(
     y = labSetTrain,
 
     # Set number of epoch aka how many "cycles" the model trains before its done
-    epochs = 10,
+    epochs = 50,
 
     # See (https://keras.io/api/models/model_training_apis/#fit-method)
     # for more info on the fit method
@@ -141,7 +187,7 @@ labSetTest_rescale = close_scaler.inverse_transform(labSetTest.reshape(-1,1))
 
 # Graph Results
 # Now with this we can compare the models predicted data and the actual values
-test_dates = df['Date'][train_split + length:].to_numpy()
+test_dates = merged['Date'][train_split + length:].to_numpy()
 plt.figure(figsize=(12,6))
 plt.plot(test_dates, labSetTest_rescale, label = 'Actual Prices')
 plt.plot(test_dates, predict_rescale, label = 'Predicted Prices')
@@ -183,13 +229,15 @@ for _ in range(future_steps):
 future_predictions = np.array(future_predictions)
 
 # Generate future dates starting from day after last available date
-last_date = df['Date'][-1]
+last_date = merged['Date'][-1]
 future_dates = [last_date + timedelta(days=i) for i in range(1, future_steps + 1)]
 
 # Plot historical prices and future predictions
 plt.figure(figsize=(14,7))
-plt.plot(df['Date'][-100:], df['Close'][-100:], 'b-', label='Historical Prices')
+plt.plot(merged['Date'][-100:], merged['Close'][-100:], 'b-', label='Historical Prices')
 plt.plot(future_dates, future_predictions, 'r-', label='Predicted Future Prices')
+plt.plot(merged['Date'][-100:], merged['Close_vix'][-100:], 'g-', label='VIX Historical Prices')
+plt.plot(future_dates, merged['Close_vix'][-future_steps:], 'g-', label='VIX Actual Prices')
 plt.axvline(x=last_date, color='k', linestyle='--', label='Prediction Start')
 plt.legend()
 plt.title(f'Stock Price Prediction - Next {future_steps} Days')
