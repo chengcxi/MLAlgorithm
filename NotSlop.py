@@ -7,7 +7,7 @@ from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 import seaborn as sns
 
-tqqq = pd.read_csv('tqqq.csv')
+tqqq = pd.read_csv('uptodatetqqq.csv')
 tqqq.shape
 tqqq.info()
 tqqq.describe()
@@ -118,7 +118,7 @@ model.compile(
     # and is well suited for problems that are large in terms of data/parameters".""
     # Whatever the fuck this means ^^^^^^
     # Learning Rate can be tweaked to attempt to improve model accuracy or training speed
-    optimizer = keras.optimizers.Adam(learning_rate=0.0001),
+    optimizer = keras.optimizers.Adam(learning_rate=0.005),
 
     # Choosing a loss equation in this case, compares the mean of the squares of errors between label and preduiction
     loss = keras.losses.MeanSquaredError()
@@ -133,7 +133,7 @@ history = model.fit(
     y = labSetTrain,
 
     # Set number of epoch aka how many "cycles" the model trains before its done
-    epochs = 10,
+    epochs = 50,
 
     # See (https://keras.io/api/models/model_training_apis/#fit-method)
     # for more info on the fit method
