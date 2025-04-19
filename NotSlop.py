@@ -102,7 +102,7 @@ def make_sequences(data: pl.DataFrame, seq_length: int):
     return np.array(sequences), np.array(labels)
 
 # Length of the sequences we want for this LSTM (1 month)
-length = 30
+length = 110
 
 # Converting scaled dataframe into sets of sequences and labels
 seqSet, labSet = make_sequences(scaled_df, length)
@@ -201,7 +201,7 @@ plt.show()
 last_sequence = seqSetTest[-1:]  # Shape: [1, 30, n_features]
 
 # Number of future days to predict
-future_steps = 30
+future_steps = 110
 
 # Make a copy of the last sequence to avoid modifying original
 current_sequence = last_sequence.copy()
