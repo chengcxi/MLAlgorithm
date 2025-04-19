@@ -1,20 +1,37 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import tensorflow as tf
 from tensorflow import keras
-import pandas as pd
+import polars as pl
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import GradientBoostingRegressor
 import numpy as np
 import seaborn as sns
 
-tqqq = pd.read_csv('uptodatetqqq.csv')
-tqqq.shape
-tqqq.info()
-tqqq.describe()
-tqqq.sort_values(by='Date')
-df = pd.DataFrame(tqqq)
-df = df.sort_values('Date')
+#Read table
+tqqq = pl.read_csv('tqqq.csv', try_parse_dates= True)
 
+tqqq.shape
+tqqq.describe()
+tqqq = tqqq.sort("Date")
+df = pl.DataFrame(tqqq)
+df = df.sort('Date')
+
+vix = pl.read_csv('vix.csv', try_parse_dates= True)
+vix = vix.sort("Date")
+vix_df = pl.DataFrame(vix)
+vix_df = vix_df.sort('Date')
+
+plt.figure(figsize=(12,6))
+plt.plot(df['Date'], df['Close'], label='TQQQ vs VIX Close Price')
+plt.plot(vix_df['Date'], vix_df['Close'], label='VIX Close Price')
+plt.title('TQQQ vs VIX Close Price')
+plt.xlabel('Date')
+plt.ylabel('Price ($)')
+plt.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
 
 # Preprocess data
 # Scales data to be floats from 0-1 because lstms work better with similar values across the board
@@ -26,54 +43,67 @@ doscale = [col for col in df.columns if col not in noscale]
 # Uses scaler object and array of columns to scale desired columns' data
 scaled_tqqq = scaler.fit_transform(df[doscale])
 # Converts scaled_tqqq(numpy array) to pandas dataframe
-scaled_df = pd.DataFrame(scaled_tqqq, columns=doscale)
+scaled_df = pl.DataFrame(scaled_tqqq, schema=doscale)
+
+# Add VIX data to the scaled dataframe
+merged = df.join(vix_df, on='Date', how='inner', suffix='_vix')
+
+# Gradient Boosting Regressor
+vix_features = [col for col in vix_df.columns if col not in ['Date', 'Volume']]
+X = merged.select([f"{col}_vix" for col in vix_features]).to_numpy()
+y = merged['Close'].to_numpy()
+
+split_idx = int(len(X) * 0.8)
+X_train, X_test = X[:split_idx], X[split_idx:]
+y_train, y_test = y[:split_idx], y[split_idx:]
+
+# Train GBDT
+gbdt = GradientBoostingRegressor(n_estimators=100, random_state=42)
+gbdt.fit(X_train, y_train)
+
+# Predict using GBDT
+gbdt_preds = gbdt.predict(X)
+merged = merged.with_columns(pl.Series("GBDT_Pred", gbdt_preds))
+
+# Include GBDT predictions in the scaled dataframe
+noscale = ['Date','Volume','Volume_vix']
+doscale = [col for col in merged.columns if col not in noscale]
+
+# Scale the merged dataframe
+scaler = MinMaxScaler(feature_range=(0,1))
+scaled_merged = scaler.fit_transform(merged[doscale])
+scaled_df = pl.DataFrame(scaled_merged, schema=doscale)
 
 # Make new scaler
 # The reason we need a new scaler because the first one operated on an array with shape (n,5)
 # but now need one for array with shape (n,1) because thats our output shape
 # we can use the .fit function to only fit it to close prices
 close_scaler = MinMaxScaler(feature_range=(0,1))
-close_scaler.fit(df[['Close']].values)
+close_scaler.fit(merged.select("Close").to_numpy())
 
 # Make Sequences
 # Partitions data into sequences meant to predict the value directly after them
 # Takes numpy array or dataframe in data, and sequence length in seq_length
-def make_sequences(data, seq_length):
-    # Convert dataframe to numpy array (will break without this because dataframes cannot have rows accessed like arrays)
-    if isinstance(data, pd.DataFrame):
-        data = data.values
-    # Example of sequences and labels
-    # Original array is [1,2,3,4,5]
-    # Given seq_length 3
-    # sequences[1] = [1,2,3]
-    # labels[4] = 4
-    # i.e array [1,2,3] is meant to be used to predict value 4
+def make_sequences(data: pl.DataFrame, seq_length: int):
     sequences = []
     labels = []
-    # loop only goes to len(data) - seq_length because there are no values to predict or test on beyond len(data)
 
-    # Appends a seq_length long series of values in data to the ith index on sequences
-    for i in range(len(data) - seq_length):
-        sequences.append(data[i:i + seq_length])
-        # Appends the value meant to be predicted by the ith index of the sequences array
-        # We only want to append ONE VALUE to the labels array because thats what we want it to predict
-        # Remember we need to append data transformed by the scaler because they work best with the lstm
-        # Grabs value of 'Close' column at i + seq_length
-        # returns a 2d array which we need because .transform expects 2d input
-        price_2d = [[df['Close'].iloc[i + seq_length]]]
+    # Convert to numpy
+    np_data = data.select(doscale).to_numpy()
+    close_prices = tqqq['Close'].to_numpy()
 
-        # Scale the 1x1 2d vector from 0 - 1
-        scaled_2d = close_scaler.transform(price_2d)
+    for i in range(len(np_data) - seq_length):
+        sequences.append(np_data[i:i + seq_length])
 
-        # Pull the float out of its 1x1 2d vector
-        scaled_value = scaled_2d[0][0]
-        
-        # Append to ith index of seq array
-        labels.append(scaled_value)
+        # Get close price (not scaled yet) and scale it
+        price = close_prices[i + seq_length]
+        scaled_price = close_scaler.transform([[price]])[0][0]
+        labels.append(scaled_price)
+
     return np.array(sequences), np.array(labels)
 
 # Length of the sequences we want for this LSTM (1 month)
-length = 30
+length = 110
 
 # Converting scaled dataframe into sets of sequences and labels
 seqSet, labSet = make_sequences(scaled_df, length)
@@ -158,7 +188,7 @@ labSetTest_rescale = close_scaler.inverse_transform(labSetTest.reshape(-1,1))
 
 # Graph Results
 # Now with this we can compare the models predicted data and the actual values
-test_dates = pd.to_datetime(df['Date'].iloc[train_split + length:])
+test_dates = merged['Date'][train_split + length:].to_numpy()
 plt.figure(figsize=(12,6))
 plt.plot(test_dates, labSetTest_rescale, label = 'Actual Prices')
 plt.plot(test_dates, predict_rescale, label = 'Predicted Prices')
@@ -168,15 +198,11 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
-# Predictions (Used AI for this got lazy)
-# Convert 'Date' column to datetime if it's not already
-df['Date'] = pd.to_datetime(df['Date'])
-
 # Get the last available sequence from your test data
 last_sequence = seqSetTest[-1:]  # Shape: [1, 30, n_features]
 
 # Number of future days to predict
-future_steps = 30
+future_steps = 110
 
 # Make a copy of the last sequence to avoid modifying original
 current_sequence = last_sequence.copy()
@@ -192,11 +218,11 @@ for _ in range(future_steps):
     current_pred_unscaled = close_scaler.inverse_transform(current_pred)[0][0]
     future_predictions.append(current_pred_unscaled)
     
-    # Update the sequence:
+    # Uplate the sequence:
     # 1. Remove first element by shifting left
     current_sequence = np.roll(current_sequence, -1, axis=1)
     
-    # 2. Update the Close price in the last position of the sequence
+    # 2. Uplate the Close price in the last position of the sequence
     # Assuming Close price is the 4th feature (index 3)
     current_sequence[0, -1, 3] = current_pred[0][0]
 
@@ -204,13 +230,15 @@ for _ in range(future_steps):
 future_predictions = np.array(future_predictions)
 
 # Generate future dates starting from day after last available date
-last_date = df['Date'].iloc[-1]
-future_dates = [last_date + pd.Timedelta(days=x) for x in range(1, future_steps+1)]
+last_date = merged['Date'][-1]
+future_dates = [last_date + timedelta(days=i) for i in range(1, future_steps + 1)]
 
 # Plot historical prices and future predictions
 plt.figure(figsize=(14,7))
-plt.plot(df['Date'][-100:], df['Close'][-100:], 'b-', label='Historical Prices')
+plt.plot(merged['Date'][-100:], merged['Close'][-100:], 'b-', label='Historical Prices')
 plt.plot(future_dates, future_predictions, 'r-', label='Predicted Future Prices')
+plt.plot(merged['Date'][-100:], merged['Close_vix'][-100:], 'g-', label='VIX Historical Prices')
+plt.plot(future_dates, merged['Close_vix'][-future_steps:], 'g-', label='VIX Actual Prices')
 plt.axvline(x=last_date, color='k', linestyle='--', label='Prediction Start')
 plt.legend()
 plt.title(f'Stock Price Prediction - Next {future_steps} Days')
