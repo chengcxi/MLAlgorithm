@@ -10,6 +10,7 @@ import seaborn as sns
 
 #Read table
 tqqq = pl.read_csv('tqqq.csv', try_parse_dates= True)
+
 tqqq.shape
 tqqq.describe()
 tqqq = tqqq.sort("Date")
