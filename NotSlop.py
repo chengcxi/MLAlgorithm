@@ -42,9 +42,10 @@ noscale = ['Date','Volume']
 doscale = [col for col in df.columns if col not in noscale]
 # Uses scaler object and array of columns to scale desired columns' data
 scaled_tqqq = scaler.fit_transform(df[doscale])
-# Converts scaled_tqqq(numpy array) to pandas dataframe
-scaled_df = pl.DataFrame(scaled_tqqq, schema=doscale)
-
+scaled_vix = scaler.fit_transform(vix_df[doscale])
+# Converts scaled_tqqq(numpy array) to polars dataframe
+scaled_tqqq_df = pl.DataFrame(scaled_tqqq, schema=doscale)
+scaled_vix_df = pl.DataFrame(scaled_vix, schema=doscale)
 # Add VIX data to the scaled dataframe
 merged = df.join(vix_df, on='Date', how='inner', suffix='_vix')
 
@@ -72,7 +73,7 @@ doscale = [col for col in merged.columns if col not in noscale]
 # Scale the merged dataframe
 scaler = MinMaxScaler(feature_range=(0,1))
 scaled_merged = scaler.fit_transform(merged[doscale])
-scaled_df = pl.DataFrame(scaled_merged, schema=doscale)
+scaled_tqqq_df = pl.DataFrame(scaled_merged, schema=doscale)
 
 # Make new scaler
 # The reason we need a new scaler because the first one operated on an array with shape (n,5)
@@ -106,7 +107,7 @@ def make_sequences(data: pl.DataFrame, seq_length: int):
 length = 110
 
 # Converting scaled dataframe into sets of sequences and labels
-seqSet, labSet = make_sequences(scaled_df, length)
+seqSet, labSet = make_sequences(scaled_tqqq_df, length)
 
 # Split into Training and Test Sets
 # Determine the split of how much of the sets do we want to be training
@@ -163,7 +164,7 @@ history = model.fit(
     y = labSetTrain,
 
     # Set number of epoch aka how many "cycles" the model trains before its done
-    epochs = 50,
+    epochs = 20,
 
     # See (https://keras.io/api/models/model_training_apis/#fit-method)
     # for more info on the fit method
@@ -237,8 +238,7 @@ future_dates = [last_date + timedelta(days=i) for i in range(1, future_steps + 1
 plt.figure(figsize=(14,7))
 plt.plot(merged['Date'][-100:], merged['Close'][-100:], 'b-', label='Historical Prices')
 plt.plot(future_dates, future_predictions, 'r-', label='Predicted Future Prices')
-plt.plot(merged['Date'][-100:], merged['Close_vix'][-100:], 'g-', label='VIX Historical Prices')
-plt.plot(future_dates, merged['Close_vix'][-future_steps:], 'g-', label='VIX Actual Prices')
+plt.plot(vix_df['Date'][-171:], vix_df['Close'][-171:], 'g-', label='VIX Historical Prices')
 plt.axvline(x=last_date, color='k', linestyle='--', label='Prediction Start')
 plt.legend()
 plt.title(f'Stock Price Prediction - Next {future_steps} Days')
