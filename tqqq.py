@@ -199,8 +199,8 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
-# Get the last available sequence from your test data
-last_sequence = seqSetTest[-1:]  # Shape: [1, 30, n_features]
+# Get the last available sequence from test data
+last_sequence = seqSetTest[-1:]  # Shape: [1, length, n_features] # length is 110
 
 # Number of future days to predict
 future_steps = 110
@@ -208,38 +208,126 @@ future_steps = 110
 # Make a copy of the last sequence to avoid modifying original
 current_sequence = last_sequence.copy()
 
-# Array to store predictions
-future_predictions = []
+# Array to store unscaled TQQQ close predictions
+future_predictions_unscaled = []
 
-for _ in range(future_steps):
-    # Get the prediction (scaled between 0-1)
-    current_pred = model.predict(current_sequence, verbose=0)
+# --- Preparation for the modified loop ---
+# 'doscale' list defines the feature order in sequences.
+# 'doscale' is:
+# ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Open_vix', 'High_vix', 'Low_vix', 'Close_vix', 'AdjClose_vix', 'GBDT_Pred']
+
+# Indices of key features in the 'doscale' list
+tqqq_close_idx = doscale.index('Close')
+
+# VIX feature names in 'doscale' and their original names in 'vix_df'
+doscale_vix_feature_names = ['Open_vix', 'High_vix', 'Low_vix', 'Close_vix', 'AdjClose_vix']
+# Original VIX column names in vix_df (these are used to fetch values and for GBDT input)
+original_vix_column_names_for_gbdt_input = [col for col in vix_df.columns if col not in ['Date', 'Volume']]
+# This should be ['Open', 'High', 'Low', 'Close', 'Adj Close']
+
+# Create a mapping from doscale_vix_feature_names to original_vix_column_names
+# This helps fetch the correct VIX value for the corresponding doscale feature
+vix_doscale_to_original_map = {
+    ds_name: og_name for ds_name, og_name in zip(doscale_vix_feature_names, original_vix_column_names_for_gbdt_input)
+}
+assert all(name in vix_doscale_to_original_map for name in doscale_vix_feature_names) # Sanity check
+
+# Indices of VIX features in 'doscale'
+vix_feature_indices_in_doscale = [doscale.index(name) for name in doscale_vix_feature_names]
+
+# Index of GBDT_Pred in 'doscale'
+gbdt_pred_idx = doscale.index('GBDT_Pred')
+
+# Generate future dates for VIX data lookup and plotting
+last_date_in_merged_data = merged['Date'][-1]  # Last date for which we have TQQQ & VIX history in 'merged'
+future_dates = [last_date_in_merged_data + timedelta(days=i) for i in range(1, future_steps + 1)]
+
+# Get actual future VIX data from vix_df
+# This assumes vix_df contains VIX data for these future_dates
+future_vix_available_df = vix_df.filter(pl.col("Date").is_in(future_dates)).sort("Date")
+
+# --- Modified Future Prediction Loop ---
+print(f"Starting future prediction loop for {future_steps} steps...")
+for k in range(future_steps):
+    # 1. Get the LSTM prediction (scaled TQQQ Close)
+    predicted_tqqq_close_scaled = model.predict(current_sequence, verbose=0)[0, 0]
     
-    # Unscale the prediction using close_scaler
-    current_pred_unscaled = close_scaler.inverse_transform(current_pred)[0][0]
-    future_predictions.append(current_pred_unscaled)
+    # 2. Unscale the TQQQ Close prediction for storage
+    predicted_tqqq_close_unscaled = close_scaler.inverse_transform([[predicted_tqqq_close_scaled]])[0, 0]
+    future_predictions_unscaled.append(predicted_tqqq_close_unscaled)
     
-    # Uplate the sequence:
-    # 1. Remove first element by shifting left
+    # If this is the last prediction step, no need to prepare sequence for a *next* prediction
+    if k == future_steps - 1:
+        break
+
+    # --- Prepare the last timestep of the *next* input sequence ---
+    # This new last timestep will contain data corresponding to `future_dates[k]`
+    
+    current_future_day_for_vix = future_dates[k]
+    
+    # Roll the sequence: first timestep is discarded, new last timestep is a copy of the previous one
     current_sequence = np.roll(current_sequence, -1, axis=1)
-    
-    # 2. Uplate the Close price in the last position of the sequence
-    # Assuming Close price is the 4th feature (index 3)
-    current_sequence[0, -1, 3] = current_pred[0][0]
+    # Get a reference to the new last slice (timestep) to update its features
+    new_last_slice_features_scaled = current_sequence[0, -1, :]
 
-# Convert to numpy array
-future_predictions = np.array(future_predictions)
+    # 3. Update TQQQ 'Close' feature in the new last slice with the latest LSTM prediction (scaled)
+    new_last_slice_features_scaled[tqqq_close_idx] = predicted_tqqq_close_scaled
 
-# Generate future dates starting from day after last available date
-last_date = merged['Date'][-1]
-future_dates = [last_date + timedelta(days=i) for i in range(1, future_steps + 1)]
+    # Try to get actual VIX data for `current_future_day_for_vix`
+    actual_vix_data_for_current_day_pl = future_vix_available_df.filter(pl.col("Date") == current_future_day_for_vix)
 
+    if not actual_vix_data_for_current_day_pl.is_empty():
+        # Actual VIX data is available for this future day
+        
+        # 4. Update VIX features in the new last slice
+        for doscale_vix_name in doscale_vix_feature_names:
+            original_vix_name = vix_doscale_to_original_map[doscale_vix_name]
+            feature_idx = doscale.index(doscale_vix_name)
+            
+            unscaled_actual_vix_value = actual_vix_data_for_current_day_pl.select(original_vix_name).item()
+            
+            # Scale this VIX value using the main 'scaler' (fitted on merged[doscale])
+            # Formula: X_scaled = (X - scaler.min_[idx]) * scaler.scale_[idx] (for feature_range=(0,1))
+            scaled_actual_vix_value = (unscaled_actual_vix_value - scaler.min_[feature_idx]) * scaler.scale_[feature_idx]
+            
+            new_last_slice_features_scaled[feature_idx] = scaled_actual_vix_value
+
+        # 5. Update 'GBDT_Pred' feature in the new last slice
+        #    a. Prepare input for GBDT model (unscaled, original VIX features)
+        gbdt_input_values_unscaled = np.array([[
+            actual_vix_data_for_current_day_pl.select(feat_name).item() for feat_name in original_vix_column_names_for_gbdt_input
+        ]])
+        
+        #    b. Get GBDT prediction (unscaled)
+        gbdt_pred_unscaled = gbdt.predict(gbdt_input_values_unscaled)[0]
+        
+        #    c. Scale the GBDT prediction
+        scaled_gbdt_pred = (gbdt_pred_unscaled - scaler.min_[gbdt_pred_idx]) * scaler.scale_[gbdt_pred_idx]
+        new_last_slice_features_scaled[gbdt_pred_idx] = scaled_gbdt_pred
+        
+        if k < 3 or k % 20 == 0: # Print for a few initial steps and then periodically
+             print(f"  Step {k+1}/{future_steps}: Updated sequence with actual VIX for {current_future_day_for_vix.strftime('%Y-%m-%d')}")
+
+    else:
+        # VIX data for current_future_day_for_vix not found in future_vix_available_df.
+        # In this case, the VIX features and GBDT_Pred in new_last_slice_features_scaled
+        # will retain the values that were rolled over from the previous timestep.
+        # TQQQ 'Close' is already updated. Other TQQQ features (Open, High, Low, AdjClose) are also rolled over.
+        if k < 3 or k % 20 == 0:
+            print(f"  Step {k+1}/{future_steps}: VIX data for {current_future_day_for_vix.strftime('%Y-%m-%d')} not found. Using rolled-over VIX/GBDT values.")
+            
+    # Note: TQQQ Open, High, Low, Adj Close features in new_last_slice_features_scaled
+    # are the values rolled over from the previous sequence's corresponding timestep.
+    # This is consistent with the original code's behavior for features not explicitly updated.
+
+# Convert list of unscaled predictions to numpy array
+future_predictions_unscaled = np.array(future_predictions_unscaled)
 # Plot historical prices and future predictions
 plt.figure(figsize=(14,7))
 plt.plot(merged['Date'][-100:], merged['Close'][-100:], 'b-', label='Historical Prices')
-plt.plot(future_dates, future_predictions, 'r-', label='Predicted Future Prices')
+plt.plot(future_dates, future_predictions_unscaled, 'r-', label='Predicted Future Prices')
 plt.plot(vix_df['Date'][-171:], vix_df['Close'][-171:], 'g-', label='VIX Historical Prices')
-plt.axvline(x=last_date, color='k', linestyle='--', label='Prediction Start')
+plt.axvline(x=last_date_in_merged_data, color='k', linestyle='--', label='Prediction Start')
 plt.legend()
 plt.title(f'Stock Price Prediction - Next {future_steps} Days')
 plt.xlabel('Date')
@@ -254,6 +342,6 @@ print("\nFuture Price Predictions:")
 print("+" + "-"*32 + "+")
 print("| Date       | Predicted Price |")
 print("+" + "-"*32 + "+")
-for date, price in zip(future_dates, future_predictions):
+for date, price in zip(future_dates, future_predictions_unscaled):
     print(f"| {date.strftime('%Y-%m-%d')} | ${price:>14.2f} |")
 print("+" + "-"*32 + "+")
