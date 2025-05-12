@@ -47,33 +47,52 @@ scaled_vix = scaler.fit_transform(vix_df[doscale])
 scaled_tqqq_df = pl.DataFrame(scaled_tqqq, schema=doscale)
 scaled_vix_df = pl.DataFrame(scaled_vix, schema=doscale)
 # Add VIX data to the scaled dataframe
-merged = df.join(vix_df, on='Date', how='inner', suffix='_vix')
+merged_for_gbdt = df.join(vix_df, on='Date', how='inner', suffix='_vix')
 
-# Gradient Boosting Regressor
-vix_features = [col for col in vix_df.columns if col not in ['Date', 'Volume']]
-X = merged.select([f"{col}_vix" for col in vix_features]).to_numpy()
-y = merged['Close'].to_numpy()
+# Define features for GBDT (original VIX column names, will be suffixed)
+gbdt_vix_original_features = [col for col in vix_df.columns if col not in ['Date', 'Volume']]
+# These are the feature names as they appear in merged_for_gbdt, used for selecting X
+gbdt_X_feature_names = [f"{col}_vix" for col in gbdt_vix_original_features]
 
-split_idx = int(len(X) * 0.8)
-X_train, X_test = X[:split_idx], X[split_idx:]
-y_train, y_test = y[:split_idx], y[split_idx:]
+X_gbdt = merged_for_gbdt.select(gbdt_X_feature_names).to_numpy()
+y_gbdt = merged_for_gbdt['Close'].to_numpy() # TQQQ Close is the target
+
+split_idx_gbdt = int(len(X_gbdt) * 0.8)
+X_train_gbdt, X_test_gbdt = X_gbdt[:split_idx_gbdt], X_gbdt[split_idx_gbdt:]
+y_train_gbdt, y_test_gbdt = y_gbdt[:split_idx_gbdt], y_gbdt[split_idx_gbdt:]
 
 # Train GBDT
 gbdt = GradientBoostingRegressor(n_estimators=100, random_state=42)
-gbdt.fit(X_train, y_train)
+gbdt.fit(X_train_gbdt, y_train_gbdt)
 
-# Predict using GBDT
-gbdt_preds = gbdt.predict(X)
-merged = merged.with_columns(pl.Series("GBDT_Pred", gbdt_preds))
+# Predict using GBDT on the entire merged_for_gbdt set to get GBDT_Pred column
+gbdt_preds_all = gbdt.predict(X_gbdt)
+merged_for_gbdt = merged_for_gbdt.with_columns(pl.Series("GBDT_Pred", gbdt_preds_all))
 
-# Include GBDT predictions in the scaled dataframe
-noscale = ['Date','Volume','Volume_vix']
+merged = merged_for_gbdt
+
+# --- LSTM Preprocessing ---
+# Define features to scale for LSTM
+# Noscale should include original VIX columns if they are still in 'merged' from a different join.
+# Assuming 'merged' columns are: TQQQ_cols, VIX_cols_suffixed, GBDT_Pred
+noscale = ['Date','Volume','Volume_vix'] # Volume from TQQQ, Volume_vix from VIX
 doscale = [col for col in merged.columns if col not in noscale]
 
-# Scale the merged dataframe
+# Scale the 'merged' dataframe (which now includes GBDT_Pred)
 scaler = MinMaxScaler(feature_range=(0,1))
-scaled_merged = scaler.fit_transform(merged[doscale])
-scaled_tqqq_df = pl.DataFrame(scaled_merged, schema=doscale)
+# Important: Fit the scaler on the data that will be used to create sequences.
+# Ensure 'doscale' only contains numeric columns intended for scaling.
+# Convert to numpy for scaler, handling potential non-numeric types if any slipped into doscale
+try:
+    doscale_numeric_data = merged.select(doscale).to_numpy()
+except pl.ComputeError as e:
+    print(f"Error converting doscale columns to numpy. Check for non-numeric types in 'doscale': {doscale}")
+    print(f"Columns in 'merged': {merged.columns}")
+    print(f"doscale list: {doscale}")
+    raise e
+
+scaled_merged_values = scaler.fit_transform(doscale_numeric_data)
+scaled_features_df = pl.DataFrame(scaled_merged_values, schema=doscale) # This df contains all features for LSTM, scaled
 
 # Make new scaler
 # The reason we need a new scaler because the first one operated on an array with shape (n,5)
@@ -85,21 +104,23 @@ close_scaler.fit(merged.select("Close").to_numpy())
 # Make Sequences
 # Partitions data into sequences meant to predict the value directly after them
 # Takes numpy array or dataframe in data, and sequence length in seq_length
-def make_sequences(data: pl.DataFrame, seq_length: int):
+def make_sequences(scaled_data_df: pl.DataFrame, full_merged_df: pl.DataFrame, seq_length: int,
+                   doscale_list: list, target_scaler: MinMaxScaler):
     sequences = []
     labels = []
 
-    # Convert to numpy
-    np_data = data.select(doscale).to_numpy()
-    close_prices = tqqq['Close'].to_numpy()
+    np_scaled_data = scaled_data_df.select(doscale_list).to_numpy()
+    # Get unscaled close prices from the *full* merged dataframe to ensure alignment
+    unscaled_close_prices_for_labels = full_merged_df['Close'].to_numpy()
 
-    for i in range(len(np_data) - seq_length):
-        sequences.append(np_data[i:i + seq_length])
+    for i in range(len(np_scaled_data) - seq_length):
+        sequences.append(np_scaled_data[i:i + seq_length])
 
-        # Get close price (not scaled yet) and scale it
-        price = close_prices[i + seq_length]
-        scaled_price = close_scaler.transform([[price]])[0][0]
-        labels.append(scaled_price)
+        # Get the unscaled close price for the label
+        price_label_unscaled = unscaled_close_prices_for_labels[i + seq_length]
+        # Scale it using the dedicated close_scaler
+        scaled_price_label = target_scaler.transform([[price_label_unscaled]])[0][0]
+        labels.append(scaled_price_label)
 
     return np.array(sequences), np.array(labels)
 
@@ -107,7 +128,7 @@ def make_sequences(data: pl.DataFrame, seq_length: int):
 length = 110
 
 # Converting scaled dataframe into sets of sequences and labels
-seqSet, labSet = make_sequences(scaled_tqqq_df, length)
+seqSet, labSet = make_sequences(scaled_features_df, merged, length, doscale, close_scaler)
 
 # Split into Training and Test Sets
 # Determine the split of how much of the sets do we want to be training
@@ -159,15 +180,11 @@ model.compile(
 # in a set number of epochs
 
 history = model.fit(
-    # Setting the training sets, x is the sequences and the y is the predicted values
     x = seqSetTrain,
     y = labSetTrain,
-
-    # Set number of epoch aka how many "cycles" the model trains before its done
-    epochs = 20,
-
-    # See (https://keras.io/api/models/model_training_apis/#fit-method)
-    # for more info on the fit method
+    epochs = 20, # more epochs for real training
+    batch_size=32, # Added batch_size
+    validation_split=0.1 # Optional: use part of training data for validation during training
 )
 
 # Predict from Tests
@@ -216,109 +233,112 @@ future_predictions_unscaled = []
 # 'doscale' is:
 # ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Open_vix', 'High_vix', 'Low_vix', 'Close_vix', 'AdjClose_vix', 'GBDT_Pred']
 
-# Indices of key features in the 'doscale' list
-tqqq_close_idx = doscale.index('Close')
-
-# VIX feature names in 'doscale' and their original names in 'vix_df'
-doscale_vix_feature_names = ['Open_vix', 'High_vix', 'Low_vix', 'Close_vix', 'AdjClose_vix']
-# Original VIX column names in vix_df (these are used to fetch values and for GBDT input)
-original_vix_column_names_for_gbdt_input = [col for col in vix_df.columns if col not in ['Date', 'Volume']]
-# This should be ['Open', 'High', 'Low', 'Close', 'Adj Close']
-
-# Create a mapping from doscale_vix_feature_names to original_vix_column_names
-# This helps fetch the correct VIX value for the corresponding doscale feature
-vix_doscale_to_original_map = {
-    ds_name: og_name for ds_name, og_name in zip(doscale_vix_feature_names, original_vix_column_names_for_gbdt_input)
-}
-assert all(name in vix_doscale_to_original_map for name in doscale_vix_feature_names) # Sanity check
-
-# Indices of VIX features in 'doscale'
-vix_feature_indices_in_doscale = [doscale.index(name) for name in doscale_vix_feature_names]
-
-# Index of GBDT_Pred in 'doscale'
+tqqq_close_idx = doscale.index('Close') # TQQQ's own close price
 gbdt_pred_idx = doscale.index('GBDT_Pred')
 
-# Generate future dates for VIX data lookup and plotting
-last_date_in_merged_data = merged['Date'][-1]  # Last date for which we have TQQQ & VIX history in 'merged'
-future_dates = [last_date_in_merged_data + timedelta(days=i) for i in range(1, future_steps + 1)]
+# VIX feature names in 'doscale' (suffixed) and their original names in 'vix_df'
+# These are the VIX columns from 'vix_df' that were used to create the GBDT features
+# Make sure this list is in the same order as GBDT model expects its input features
+# gbdt_vix_original_features was defined earlier: [col for col in vix_df.columns if col not in ['Date', 'Volume']]
+# So, this should be ['Open', 'High', 'Low', 'Close', 'Adj Close'] (or similar, check vix.csv headers)
 
-# Get actual future VIX data from vix_df
-# This assumes vix_df contains VIX data for these future_dates
-future_vix_available_df = vix_df.filter(pl.col("Date").is_in(future_dates)).sort("Date")
+# Map from the suffixed names in 'doscale' to original names in 'vix_df'
+# Example: if gbdt_vix_original_features = ['Open', 'High', ..., 'Adj Close']
+# and corresponding doscale names are 'Open_vix', 'High_vix', ..., 'Adj Close_vix'
+doscale_vix_feature_names_suffixed = [f"{col}_vix" for col in gbdt_vix_original_features]
+
+# Check if all these suffixed names are actually in 'doscale'
+missing_suffixed_vix_in_doscale = [name for name in doscale_vix_feature_names_suffixed if name not in doscale]
+if missing_suffixed_vix_in_doscale:
+    raise ValueError(f"Suffixed VIX feature names {missing_suffixed_vix_in_doscale} not found in 'doscale' list ({doscale}). Check suffixing and 'doscale' definition.")
+
+vix_feature_indices_in_doscale = [doscale.index(name) for name in doscale_vix_feature_names_suffixed]
+
+# Generate future dates
+# Ensure 'merged' is sorted by 'Date' to get the correct last date.
+# The initial sort of df and vix_df and inner join should maintain this.
+last_date_in_merged_data = merged['Date'][-1]
+future_dates = [last_date_in_merged_data + timedelta(days=i) for i in range(1, future_steps + 1)]
 
 # --- Modified Future Prediction Loop ---
 print(f"Starting future prediction loop for {future_steps} steps...")
+future_predictions = []
+
 for k in range(future_steps):
-    # 1. Get the LSTM prediction (scaled TQQQ Close)
+    # Predict TQQQ Close (scaled) for the next step
     predicted_tqqq_close_scaled = model.predict(current_sequence, verbose=0)[0, 0]
-    
-    # 2. Unscale the TQQQ Close prediction for storage
+
+    # Unscale the prediction
     predicted_tqqq_close_unscaled = close_scaler.inverse_transform([[predicted_tqqq_close_scaled]])[0, 0]
     future_predictions_unscaled.append(predicted_tqqq_close_unscaled)
-    
-    # If this is the last prediction step, no need to prepare sequence for a *next* prediction
+
+    # If this is the last prediction needed, break
     if k == future_steps - 1:
         break
 
-    # --- Prepare the last timestep of the *next* input sequence ---
-    # This new last timestep will contain data corresponding to `future_dates[k]`
-    
-    current_future_day_for_vix = future_dates[k]
-    
-    # Roll the sequence: first timestep is discarded, new last timestep is a copy of the previous one
+    # --- Prepare the next input sequence ---
+    # Roll the sequence to make space for the new day's features
     current_sequence = np.roll(current_sequence, -1, axis=1)
-    # Get a reference to the new last slice (timestep) to update its features
+    # `new_last_slice_features_scaled` is a view into `current_sequence`
     new_last_slice_features_scaled = current_sequence[0, -1, :]
 
-    # 3. Update TQQQ 'Close' feature in the new last slice with the latest LSTM prediction (scaled)
+    # 1. Update TQQQ 'Close' feature with the latest (scaled) prediction
     new_last_slice_features_scaled[tqqq_close_idx] = predicted_tqqq_close_scaled
 
-    # Try to get actual VIX data for `current_future_day_for_vix`
-    actual_vix_data_for_current_day_pl = future_vix_available_df.filter(pl.col("Date") == current_future_day_for_vix)
+    # 2. Get VIX data for the current future day
+    current_future_day_for_vix = future_dates[k] # This is the date for which we need VIX data
+                                                 # to form features for predicting TQQQ on day k+1
 
-    if not actual_vix_data_for_current_day_pl.is_empty():
-        # Actual VIX data is available for this future day
-        
-        # 4. Update VIX features in the new last slice
-        for doscale_vix_name in doscale_vix_feature_names:
-            original_vix_name = vix_doscale_to_original_map[doscale_vix_name]
-            feature_idx = doscale.index(doscale_vix_name)
-            
-            unscaled_actual_vix_value = actual_vix_data_for_current_day_pl.select(original_vix_name).item()
-            
-            # Scale this VIX value using the main 'scaler' (fitted on merged[doscale])
-            # Formula: X_scaled = (X - scaler.min_[idx]) * scaler.scale_[idx] (for feature_range=(0,1))
-            scaled_actual_vix_value = (unscaled_actual_vix_value - scaler.min_[feature_idx]) * scaler.scale_[feature_idx]
-            
-            new_last_slice_features_scaled[feature_idx] = scaled_actual_vix_value
+    actual_vix_row_df = vix_df.filter(pl.col("Date") == current_future_day_for_vix)
 
-        # 5. Update 'GBDT_Pred' feature in the new last slice
-        #    a. Prepare input for GBDT model (unscaled, original VIX features)
-        gbdt_input_values_unscaled = np.array([[
-            actual_vix_data_for_current_day_pl.select(feat_name).item() for feat_name in original_vix_column_names_for_gbdt_input
-        ]])
-        
-        #    b. Get GBDT prediction (unscaled)
-        gbdt_pred_unscaled = gbdt.predict(gbdt_input_values_unscaled)[0]
-        
-        #    c. Scale the GBDT prediction
-        scaled_gbdt_pred = (gbdt_pred_unscaled - scaler.min_[gbdt_pred_idx]) * scaler.scale_[gbdt_pred_idx]
+    if not actual_vix_row_df.is_empty():
+        if k < 3 or k % 20 == 0 or k == future_steps -2 :
+             print(f"  Step {k+1}/{future_steps}: Using actual VIX for {current_future_day_for_vix.strftime('%Y-%m-%d')}")
+
+        # Prepare unscaled VIX features for GBDT input
+        gbdt_input_unscaled_vix_values = []
+        for original_vix_name in gbdt_vix_original_features: # Iterate in the order GBDT expects
+            gbdt_input_unscaled_vix_values.append(actual_vix_row_df.select(original_vix_name).item())
+
+        # 2a. Update GBDT_Pred based on actual VIX
+        # GBDT expects a 2D array of unscaled VIX values
+        gbdt_pred_unscaled = gbdt.predict(np.array([gbdt_input_unscaled_vix_values]))[0]
+        # Scale the new GBDT prediction using the main 'scaler'
+        # Correct scaling: value * scaler.scale_[idx] + scaler.min_[idx]
+        scaled_gbdt_pred = gbdt_pred_unscaled * scaler.scale_[gbdt_pred_idx] + scaler.min_[gbdt_pred_idx]
         new_last_slice_features_scaled[gbdt_pred_idx] = scaled_gbdt_pred
-        
-        if k < 3 or k % 20 == 0: # Print for a few initial steps and then periodically
-             print(f"  Step {k+1}/{future_steps}: Updated sequence with actual VIX for {current_future_day_for_vix.strftime('%Y-%m-%d')}")
 
+        # 2b. Update individual VIX features (Open_vix, High_vix, etc.)
+        for i, suffixed_vix_name in enumerate(doscale_vix_feature_names_suffixed):
+            original_vix_name = gbdt_vix_original_features[i] # Get corresponding original name
+            feature_idx_in_doscale = vix_feature_indices_in_doscale[i] # Index in 'doscale'
+
+            unscaled_actual_vix_value = actual_vix_row_df.select(original_vix_name).item()
+
+            # Scale this VIX value using the main 'scaler'
+            # Correct scaling: value * scaler.scale_[idx] + scaler.min_[idx]
+            scaled_actual_vix_value = unscaled_actual_vix_value * scaler.scale_[feature_idx_in_doscale] + scaler.min_[feature_idx_in_doscale]
+            new_last_slice_features_scaled[feature_idx_in_doscale] = scaled_actual_vix_value
     else:
-        # VIX data for current_future_day_for_vix not found in future_vix_available_df.
-        # In this case, the VIX features and GBDT_Pred in new_last_slice_features_scaled
-        # will retain the values that were rolled over from the previous timestep.
-        # TQQQ 'Close' is already updated. Other TQQQ features (Open, High, Low, AdjClose) are also rolled over.
-        if k < 3 or k % 20 == 0:
-            print(f"  Step {k+1}/{future_steps}: VIX data for {current_future_day_for_vix.strftime('%Y-%m-%d')} not found. Using rolled-over VIX/GBDT values.")
+        # If no actual VIX data, VIX features and GBDT_Pred in new_last_slice_features_scaled
+        # will retain their rolled-over values from the previous timestep.
+        if k < 3 or k % 20 == 0 or k == future_steps -2 :
+            print(f"  Step {k+1}/{future_steps}: No VIX data for {current_future_day_for_vix.strftime('%Y-%m-%d')}. VIX features & GBDT_Pred rolled over.")
+            current_pred = model.predict(current_sequence, verbose=0)
+            # Unscale the prediction using close_scaler
+            current_pred_unscaled = close_scaler.inverse_transform(current_pred)[0][0]
+            future_predictions.append(current_pred_unscaled)
             
-    # Note: TQQQ Open, High, Low, Adj Close features in new_last_slice_features_scaled
-    # are the values rolled over from the previous sequence's corresponding timestep.
-    # This is consistent with the original code's behavior for features not explicitly updated.
+            # Uplate the sequence:
+            # 1. Remove first element by shifting left
+            current_sequence = np.roll(current_sequence, -1, axis=1)
+            
+            # 2. Uplate the Close price in the last position of the sequence
+            # Assuming Close price is the 4th feature (index 3)
+            current_sequence[0, -1, 3] = current_pred[0][0]
+
+    # Other TQQQ features (Open, High, Low, Adj Close) in new_last_slice_features_scaled
+    # are currently rolled over. If you have models to predict them, they could be updated here too.
 
 # Convert list of unscaled predictions to numpy array
 future_predictions_unscaled = np.array(future_predictions_unscaled)
